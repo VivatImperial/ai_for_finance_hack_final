@@ -8,6 +8,7 @@ from decimal import Decimal
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Sequence
+from urllib.parse import urlparse
 
 import structlog
 from qdrant_client.http.models import FieldCondition, MatchValue
@@ -71,6 +72,23 @@ class VectorSearchError(Exception):
 
 
 class RagAgent:
+    _RUSSIAN_NEWS_DOMAINS = (
+        "cbr.ru",
+        "tass.ru",
+        "ria.ru",
+        "rbc.ru",
+        "vedomosti.ru",
+        "kommersant.ru",
+        "interfax.ru",
+        "banki.ru",
+        "finmarket.ru",
+        "iz.ru",
+        "1prime.ru",
+        "forbes.ru",
+        "rg.ru",
+        "vestifinance.ru",
+    )
+
     def __init__(
         self,
         *,
@@ -86,6 +104,7 @@ class RagAgent:
         self._top_k = self._config.default_top_k
         self._score_threshold = self._config.default_score_threshold
         self._rrf_k = self._config.rrf_k
+        self._default_use_query_expansion = bool(self._config.use_query_expansion)
         self._kb_settings = self._config.knowledge_base
         self._kb_embeddings = OpenRouterEmbeddingClient.from_settings()
         self._kb_store = QdrantVectorStore(
@@ -128,6 +147,7 @@ class RagAgent:
                 getattr(settings, "RAG_RESERVED_SYSTEM_TOKENS", 2000)
             ),
         )
+        self._preferred_news_domains = set(self._RUSSIAN_NEWS_DOMAINS)
 
     async def run(
         self,
@@ -214,6 +234,7 @@ class RagAgent:
                     selected_ids=selected_document_ids,
                     intent=decision.intent,
                     current_datetime=current_dt_iso,
+                    use_query_expansion=decision.use_query_expansion,
                 )
                 debug["tool_calls"] = tool_usage
             except VectorSearchError as exc:
@@ -415,6 +436,7 @@ class RagAgent:
         selected_ids: Sequence[int] | None,
         intent: str | None,
         current_datetime: str,
+        use_query_expansion: bool | None,
     ) -> tuple[str, list[VectorSearchResult], list[dict[str, Any]]]:
         messages = self._build_tool_messages(
             scenario=scenario,
@@ -436,6 +458,7 @@ class RagAgent:
             instructions=instructions,
             intent=intent,
             current_datetime=current_datetime,
+            use_query_expansion=use_query_expansion,
         )
         collected_chunks: list[VectorSearchResult] = []
         tool_debug: list[dict[str, Any]] = []
@@ -807,6 +830,7 @@ class RagAgent:
         query: str,
         document_ids: Sequence[int] | None,
         history: list[dict[str, str]],
+        limit: int | None = None,
     ) -> tuple[list[VectorSearchResult], dict[str, Any]]:
         from services.document_service import search_document_chunks
 
@@ -814,9 +838,14 @@ class RagAgent:
             query=query, history=history, selected_ids=document_ids
         )
         expansions = plan.expansions
+        target_limit = limit or self._top_k
         if not expansions:
             plain = await self._search_chunks(
-                db=db, user=user, query=query, document_ids=document_ids
+                db=db,
+                user=user,
+                query=query,
+                document_ids=document_ids,
+                limit=target_limit,
             )
             return list(plain), {
                 "expansions": [],
@@ -825,7 +854,7 @@ class RagAgent:
                 "rerank": plan.rerank,
             }
 
-        per_query = max(2, math.ceil(self._top_k / len(expansions)))
+        per_query = max(2, math.ceil(target_limit / len(expansions)))
         results_by_query: list[list[VectorSearchResult]] = []
         start = time.perf_counter()
         try:
@@ -846,7 +875,7 @@ class RagAgent:
             ) from exc
 
         fused = self._rrf_merge(
-            results_by_query=results_by_query, k=self._rrf_k, limit=self._top_k
+            results_by_query=results_by_query, k=self._rrf_k, limit=target_limit
         )
         duration_ms = (time.perf_counter() - start) * 1000
         self._log_retrieval_event(
@@ -865,6 +894,7 @@ class RagAgent:
             "per_query": per_query,
             "merged": len(fused),
             "rerank": plan.rerank,
+            "limit": target_limit,
         }
         return fused, debug
 
@@ -948,6 +978,57 @@ class RagAgent:
 
         # Fallback
         return "Пожалуйста, уточните ваш вопрос."
+
+    @staticmethod
+    def _bias_news_query(query: str) -> str:
+        base = query.strip()
+        if not base:
+            return "финансовые новости России"
+        normalized = base.lower()
+        if "россия" in normalized or "рф" in normalized:
+            return base
+        return f"{base} Россия"
+
+    def _prioritize_news_results(
+        self, results: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not results:
+            return []
+
+        deduped: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for item in results:
+            url = (item.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            deduped.append(item)
+
+        russian: list[dict[str, Any]] = []
+        global_: list[dict[str, Any]] = []
+        for item in deduped:
+            if self._is_russian_source(item):
+                russian.append(item)
+            else:
+                global_.append(item)
+        return russian + global_
+
+    def _is_russian_source(self, item: dict[str, Any]) -> bool:
+        url = (item.get("url") or "").strip()
+        hostname = ""
+        if url:
+            try:
+                hostname = urlparse(url).hostname or ""
+            except ValueError:
+                hostname = ""
+        hostname = hostname.lower()
+        if any(hostname.endswith(domain) for domain in self._preferred_news_domains):
+            return True
+
+        snippet = (
+            f"{item.get('title', '')} {item.get('content', '')}".lower()
+        )
+        return any("а" <= ch <= "я" or ch == "ё" for ch in snippet)
 
     def _answer_format_instructions(self) -> str:
         """
@@ -1289,6 +1370,20 @@ class RagAgent:
             payload.update(metadata)
         logger.info("rag-retrieval", **payload)
 
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y"}:
+                return True
+            if lowered in {"false", "0", "no", "n"}:
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return None
+
     async def _tool_search_user_documents(
         self, invocation: ToolInvocation, context: ToolContext
     ) -> ToolResult:
@@ -1299,19 +1394,73 @@ class RagAgent:
         if not document_ids:
             document_ids = context.selected_document_ids
         limit = invocation.arguments.get("limit")
-        results = await self._search_chunks(
-            db=context.db,
-            user=context.user,
-            query=query,
-            document_ids=list(document_ids or []) or None,
-            limit=int(limit) if isinstance(limit, int) else None,
+        parsed_limit = int(limit) if isinstance(limit, int) else None
+
+        requested_expansion = self._coerce_bool(
+            invocation.arguments.get("use_query_expansion")
         )
+        context_flag = (
+            context.use_query_expansion
+            if isinstance(context.use_query_expansion, bool)
+            else None
+        )
+        default_flag: bool | None = None
+        if context.intent in {"document_search", "hybrid_kb_docs"} or context.scenario in {
+            1,
+            2,
+            4,
+        }:
+            default_flag = self._default_use_query_expansion
+
+        should_expand = next(
+            (
+                flag
+                for flag in (requested_expansion, context_flag, default_flag)
+                if flag is not None
+            ),
+            False,
+        )
+
+        results: list[VectorSearchResult]
+        search_meta: dict[str, Any] = {
+            "strategy": "single_query",
+            "limit": parsed_limit or self._top_k,
+        }
+
+        if should_expand:
+            expanded, extra = await self._search_with_expansion(
+                db=context.db,
+                user=context.user,
+                query=query,
+                document_ids=list(document_ids or []) or None,
+                history=context.history,
+                limit=parsed_limit,
+            )
+            results = expanded
+            search_meta = {
+                "strategy": "query_expansion",
+                "expansions": extra.get("expansions", []),
+                "notes": extra.get("notes"),
+                "per_query": extra.get("per_query"),
+                "limit": extra.get("limit", parsed_limit or self._top_k),
+            }
+        else:
+            results = await self._search_chunks(
+                db=context.db,
+                user=context.user,
+                query=query,
+                document_ids=list(document_ids or []) or None,
+                limit=parsed_limit or self._top_k,
+            )
+
         chunks_payload = [self._serialize_chunk(r) for r in results]
         return ToolResult(
             content={
                 "status": "ok",
                 "chunks": chunks_payload,
                 "query": query,
+                "meta": search_meta,
+                "use_query_expansion": should_expand,
             },
             used_chunks=list(results),
         )
@@ -1407,17 +1556,61 @@ class RagAgent:
         max_results = invocation.arguments.get("max_results")
         days = invocation.arguments.get("days")
 
-        # Don't filter by domains - let Tavily find best sources
-        # Russian sources don't work well with include_domains filtering
-        response = await self._tavily_client.search(
-            query=query,
-            max_results=int(max_results) if isinstance(max_results, int) else 5,
+        target_results = int(max_results) if isinstance(max_results, int) else 5
+        window_days = int(days) if isinstance(days, int) else 7
+
+        ru_query = self._bias_news_query(query)
+        ru_response = await self._tavily_client.search(
+            query=ru_query,
+            max_results=target_results,
             search_depth="advanced",
-            topic="news",  # Focus on news articles
-            days=int(days) if isinstance(days, int) else 7,  # Default to last 7 days
-            # Removed include_domains - doesn't work well with Russian sources
+            topic="news",
+            days=window_days,
+            include_domains=list(self._preferred_news_domains),
+            include_answer=True,
         )
-        return ToolResult(content=response)
+        ru_results = ru_response.get("results", [])
+
+        combined_results = self._prioritize_news_results(ru_results)
+        meta: dict[str, Any] = {
+            "query": query,
+            "ru_query": ru_query,
+            "ru_results": len(ru_results),
+            "preferred_domains": list(self._preferred_news_domains),
+        }
+        status = ru_response.get("status", "ok")
+        cached = bool(ru_response.get("cached", False))
+
+        if len(combined_results) < target_results:
+            fallback_query = f"{query} финансы Россия"
+            fallback = await self._tavily_client.search(
+                query=fallback_query,
+                max_results=target_results,
+                search_depth="advanced",
+                topic="news",
+                days=window_days,
+                include_answer=True,
+            )
+            fallback_results = fallback.get("results", [])
+            meta["fallback_results"] = len(fallback_results)
+            meta["fallback_query"] = fallback_query
+            combined_results = self._prioritize_news_results(
+                ru_results + fallback_results
+            )
+            status = fallback.get("status", status)
+            cached = cached and bool(fallback.get("cached", False))
+
+        final_results = combined_results[:target_results]
+        meta["returned"] = len(final_results)
+
+        return ToolResult(
+            content={
+                "status": status,
+                "results": final_results,
+                "cached": cached,
+                "meta": meta,
+            }
+        )
 
     def _build_tool_registry(self) -> ToolRegistry:
         definitions = [
@@ -1441,6 +1634,10 @@ class RagAgent:
                             "minimum": 1,
                             "maximum": 20,
                             "description": "Максимум возвращаемых фрагментов",
+                        },
+                        "use_query_expansion": {
+                            "type": "boolean",
+                            "description": "Включить расширение запроса для повышения полноты поиска",
                         },
                     },
                     "required": ["query"],

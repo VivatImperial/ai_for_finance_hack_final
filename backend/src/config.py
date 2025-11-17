@@ -33,8 +33,8 @@ class Settings(BaseSettings):
 
     RAG_MESSAGES_LIMIT: int = 20
     RAG_MAX_CONTEXT_CHARS: int = 50_000
-    RAG_DEFAULT_TOP_K: int = 8
-    RAG_DEFAULT_SCORE_THRESHOLD: float | None = 0.7
+    RAG_DEFAULT_TOP_K: int = 12
+    RAG_DEFAULT_SCORE_THRESHOLD: float | None = 0.5
     RAG_USE_QUERY_EXPANSION: bool = True
     RAG_RRF_K: int = 60
     RAG_ORCHESTRATOR_CONFIDENCE_THRESHOLD: float = 0.6
@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     RAG_KB_COLLECTION_NAME: str = "knowledge_base_chunks"
     RAG_KB_USER_ID: int = 0
     RAG_KB_LIMIT: int = 6
-    RAG_KB_SCORE_THRESHOLD: float | None = 0.68
+    RAG_KB_SCORE_THRESHOLD: float | None = 0.6
 
     CBR_API_BASE_URL: str = "https://cbr.ru/DailyInfoWebServ/DailyInfo.asmx"
     CBR_CACHE_TTL_SECONDS: int = 900

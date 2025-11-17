@@ -49,6 +49,7 @@ class ToolContext:
     instructions: str
     intent: str | None
     current_datetime: str | None = None
+    use_query_expansion: bool | None = None
 
 
 class ToolRegistry:
